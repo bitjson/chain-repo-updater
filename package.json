@@ -1,0 +1,19 @@
+{
+  "name": "chain-repo-updater",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "zeromq": "^6.3.0"
+  },
+  "scripts": {
+    "chipnet": "bun run chain-repo-updater.ts --chipnet --cli='bitcoin-bchn-chipnet' /storage/bch-chipnet",
+    "testnet3": "bun run chain-repo-updater.ts --testnet3 --cli='bitcoin-bchn-testnet' /storage/bch-testnet3",
+    "testnet4": "bun run chain-repo-updater.ts --testnet4 --cli='bitcoin-bchn-testnet4' /storage/bch-testnet4",
+    "mainnet": "bun run chain-repo-updater.ts --mainnet --cli='bitcoin-bchn' /storage/bch-mainnet"
+  }
+}
