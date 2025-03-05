@@ -13,8 +13,7 @@
 import { parseArgs } from 'util';
 import { spawn } from 'bun';
 import { mkdirSync, readdirSync, existsSync, rmSync, writeFileSync } from 'fs';
-import { join } from 'path';
-import { Subscriber } from 'zeromq';
+import { join, resolve } from 'path';
 
 interface CliOptions {
   help?: boolean;
@@ -24,7 +23,7 @@ interface CliOptions {
   chipnet?: boolean;
   'zmq-port'?: string;
   'zmq-host'?: string;
-  cli?: string;
+  cli?: string; // e.g. "/path/to/cli -datadir=foo"
   verbose?: boolean;
   'no-push'?: boolean;
 }
@@ -46,7 +45,6 @@ const parsed = parseArgs({
     'no-push': { type: 'boolean' },
   },
 });
-
 const opts = parsed.values as CliOptions;
 const positionals = parsed.positionals || [];
 
@@ -67,12 +65,11 @@ Usage:
     --help
 
 Example:
-  bun run chain-repo-updater.ts --mainnet --cli="bitcoin-cli" /data/bch-mainnet
+  bun run chain-repo-updater.ts --mainnet --cli="bitcoin-cli -datadir=/my/data" /storage/bch-mainnet
 `);
   process.exit(0);
 }
 
-/** List of possible network flags, typed as const so we can safely use .find(...) */
 const netFlags = ['mainnet', 'testnet3', 'testnet4', 'chipnet'] as const;
 const chosenFlag: NetFlag | undefined = netFlags.find((flag) => opts[flag]);
 
@@ -90,32 +87,47 @@ if (!repoPath || typeof repoPath !== 'string') {
 }
 
 const defaultPorts: Record<NetFlag, string> = {
-  mainnet: '28332',
+  mainnet: '8332',
   testnet3: '18332',
-  testnet4: '28334',
-  chipnet: '38332',
+  testnet4: '28332',
+  chipnet: '48332',
 };
 
 const verbose = !!opts.verbose;
 const noPush = !!opts['no-push'];
-const cliCmd = opts.cli || 'bitcoin-cli';
+const cliRaw = opts.cli || 'bitcoin-cli'; // "bitcoin-cli -datadir=..."
 const zmqHost = opts['zmq-host'] || '127.0.0.1';
 const zmqPort =
   opts['zmq-port'] || (chosenFlag ? defaultPorts[chosenFlag] : '28332');
 
-/** Helper to run a command and return stdout */
-async function runCmd(
-  cmd: string,
-  args: string[],
-  allowFail = false
-): Promise<string> {
-  if (verbose) console.log('>', cmd, ...args);
-  const proc = spawn([cmd, ...args], { stdout: 'pipe', stderr: 'pipe' });
+function parseCliString(cliStr: string): {
+  cliPath: string;
+  defaultArgs: string[];
+} {
+  const parts = cliStr.trim().split(/\s+/);
+  if (!parts.length) {
+    return { cliPath: 'bitcoin-cli', defaultArgs: [] };
+  }
+  const cliPath = parts[0];
+  const defaultArgs = parts.slice(1);
+  return { cliPath, defaultArgs };
+}
+
+const { cliPath, defaultArgs: cliDefaultArgs } = parseCliString(cliRaw);
+const cli = [cliPath, ...cliDefaultArgs];
+
+if (verbose) {
+  console.log('Parsed CLI array:', cli);
+}
+
+async function runCmd(cmdArray: string[], allowFail = false): Promise<string> {
+  if (verbose) console.log('> ', cmdArray.join(' '));
+  const proc = spawn(cmdArray, { stdout: 'pipe', stderr: 'pipe' });
   const out = await new Response(proc.stdout).text();
   const err = await new Response(proc.stderr).text();
   const code = await proc.exited;
   if (!allowFail && code !== 0) {
-    throw new Error(`Command failed: ${cmd} ${args.join(' ')}\n${err || out}`);
+    throw new Error(`Command failed:\n${cmdArray.join(' ')}\n${err || out}`);
   }
   return out.trim();
 }
@@ -150,8 +162,8 @@ function findLastHeight(): number {
     .map((d) => parseInt(d.name))
     .sort((a, b) => a - b);
   if (!subDirs.length) return -1;
-  const lastSub = subDirs[subDirs.length - 1].toString();
 
+  const lastSub = subDirs[subDirs.length - 1].toString();
   const files = readdirSync(join(blocksDir, lastTopStr, lastSub))
     .filter((f) => f.endsWith('.block'))
     .map((f) => parseInt(f.split('_')[0]))
@@ -159,18 +171,21 @@ function findLastHeight(): number {
   return files.length ? files[files.length - 1] : -1;
 }
 
-/** Download a block in hex, convert to binary, handle stale files if the hash changed */
-async function fetchBlock(height: number) {
-  const hashOut = await runCmd(cliCmd, ['getblockhash', String(height)], true);
-  if (/out of range|error code: -8/i.test(hashOut)) {
+/**
+ * Fetch a single block in hex, store it, return the block's hash as a string.
+ * If out of range, throw RangeError so the caller can handle it.
+ */
+async function fetchBlock(height: number): Promise<string> {
+  const hash = await runCmd([...cli, 'getblockhash', String(height)], true);
+  if (hash.length === 0) {
+    // stdout was empty
     throw new RangeError(`Block ${height} out of range`);
   }
-  const hash = hashOut.trim();
   const dest = join(repoPath, buildBlockPath(height, hash));
   const dir = dest.slice(0, dest.lastIndexOf('/'));
   mkdirSync(dir, { recursive: true });
 
-  // remove stale
+  // Remove stale
   readdirSync(dir)
     .filter(
       (f) => f.startsWith(`${height}_`) && f !== `${height}_${hash}.block`
@@ -180,55 +195,69 @@ async function fetchBlock(height: number) {
       console.log('Removed stale block:', stale);
     });
 
-  // fetch + write if missing
+  // If missing, fetch & write
   if (!existsSync(dest)) {
-    const blockHex = await runCmd(cliCmd, ['getblock', hash, '0']);
+    const blockHex = await runCmd([...cli, 'getblock', hash, '0']);
     const blockBin = Buffer.from(blockHex, 'hex');
     writeFileSync(dest, blockBin);
     console.log(`Saved block ${height} => ${dest}`);
   }
+  return hash;
 }
 
-/** Sync blocks from 'start' up to chain tip (or until out of range error) */
-async function syncFrom(start: number) {
+/**
+ * Sync from 'start' to chain tip, returning the last successful { height, hash }.
+ * If everything is out of range from the start, we'll return null or {height:-1,hash:''}.
+ */
+async function syncFrom(
+  start: number
+): Promise<{ height: number; hash: string } | null> {
   let h = Math.max(0, start);
-  for (;;) {
+  let lastHash = '';
+  let lastHeight = -1;
+  if (verbose) console.log(`Syncing from height: ${h}`);
+  while (true) {
     try {
-      await fetchBlock(h);
+      const fetchedHash = await fetchBlock(h);
+      lastHeight = h;
+      lastHash = fetchedHash;
       h++;
     } catch (e) {
-      if (e instanceof RangeError) return h - 1; // out of range
-      throw e;
+      if (e instanceof RangeError) {
+        if (verbose) console.log(`Reached tip, last height: ${lastHeight}`);
+        // we reached chain tip
+        // if we never fetched anything, return null
+        return lastHeight < 0 ? null : { height: lastHeight, hash: lastHash };
+      }
+      throw e; // unknown error
     }
   }
 }
 
 /** Perform sync from last known - 11, then commit & push */
 async function performSync() {
+  if (verbose) console.log('Performing sync...');
   const lastLocal = findLastHeight();
+  if (verbose) console.log(`Last height: ${lastLocal}`);
   const resume = Math.max(0, lastLocal - 11);
-  const newTip = await syncFrom(resume);
-  if (newTip < 0) {
+  const result = await syncFrom(resume);
+  if (!result) {
     if (verbose) console.log('No new blocks synced.');
     return;
   }
-  // commit
-  const tipHash = await runCmd(cliCmd, ['getblockhash', String(newTip)], true);
-  await runCmd('git', ['add', 'blocks']);
+  const { height, hash } = result;
+  console.log(`Sync completed at block ${height}. Committing to git...`);
+  await runCmd(['git', 'add', 'blocks']);
   await runCmd(
-    'git',
-    ['commit', '-m', `Synced to block ${newTip} (${tipHash})`],
+    ['git', 'commit', '-m', `Synced to block ${height} (${hash})`],
     true
   );
   if (!noPush) {
-    await runCmd('git', ['push'], true);
+    await runCmd(['git', 'push'], true);
   }
-  console.log(`Sync completed at block ${newTip}`);
 }
 
-/** Main script */
 (async function main() {
-  // cd into repo
   try {
     process.chdir(repoPath);
   } catch {
@@ -236,22 +265,19 @@ async function performSync() {
     process.exit(1);
   }
 
-  // initialize if not a git repo
   let isGit = true;
   try {
-    await runCmd('git', ['rev-parse', '--is-inside-work-tree']);
+    await runCmd(['git', 'rev-parse', '--is-inside-work-tree']);
   } catch {
     isGit = false;
   }
   if (!isGit) {
-    await runCmd('git', ['init']);
-    await runCmd('git', ['config', '--local', 'http.version', 'HTTP/1.1']);
+    await runCmd(['git', 'init']);
+    await runCmd(['git', 'config', '--local', 'http.version', 'HTTP/1.1']);
     mkdirSync('blocks', { recursive: true });
-    // Git LFS steps
-    await runCmd('git', ['lfs', 'install', '--local'], true);
-    await runCmd('git', ['lfs', 'track', '*.block'], true);
-    await runCmd('git', ['add', '.gitattributes'], true);
-    await runCmd('git', ['commit', '-m', 'Configure LFS for *.block'], true);
+    await runCmd(['git', 'lfs', 'install', '--local'], true);
+    await runCmd(['git', 'lfs', 'track', '*.block'], true);
+    await runCmd(['git', 'add', '.'], true);
     if (verbose) console.log('Initialized Git + LFS');
   } else {
     mkdirSync('blocks', { recursive: true });
@@ -260,16 +286,43 @@ async function performSync() {
   console.log('Beginning sync...');
   await performSync();
 
-  // subscribe to ZMQ
-  const sub = new Subscriber();
-  sub.connect(`tcp://${zmqHost}:${zmqPort}`);
-  sub.subscribe('hashblock');
-  if (verbose)
-    console.log(`Subscribed to ZMQ: tcp://${zmqHost}:${zmqPort} (hashblock)`);
-  for await (const [topic] of sub) {
-    if (topic.toString() === 'hashblock') {
-      if (verbose) console.log('ZMQ hashblock => re-sync last ~11 blocks...');
-      await performSync();
+  /** Spawn a Node child process for ZeroMQ subscription (zeromq doesn't support Bun v1.2.4) */
+  const nodeZmqBridge = `
+    const zmq = require('zeromq');
+    (async()=>{
+      const sock = new zmq.Subscriber();
+      sock.connect('tcp://${zmqHost}:${zmqPort}');
+      sock.subscribe('hashblock');
+      for await (const [topic] of sock) {
+        if(topic.toString()==='hashblock'){
+          process.stdout.write('hashblock\\n');
+        }
+      }
+    })();
+  `;
+  const child = spawn(['node', '-e', nodeZmqBridge], {
+    cwd: resolve(import.meta.dir),
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  console.log(
+    `Spawned Node child for ZMQ at ${zmqHost}:${zmqPort}, waiting for new blocks...`
+  );
+  child.stderr.pipeTo(
+    new WritableStream({
+      write(chunk) {
+        console.error('ZMQ child error:', new TextDecoder().decode(chunk));
+      },
+    })
+  );
+  const reader = child.stdout.getReader();
+  while (true) {
+    const { done } = await reader.read();
+    if (done) {
+      console.log('ZMQ child ended or closed stdout. Exiting...');
+      break;
     }
+    console.log('ZMQ: hashblock => performing sync...');
+    await performSync();
   }
 })();
