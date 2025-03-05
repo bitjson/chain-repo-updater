@@ -7,13 +7,11 @@
   "peerDependencies": {
     "typescript": "^5"
   },
-  "dependencies": {
-    "zeromq": "^6.3.0"
-  },
+  "dependencies": {},
   "scripts": {
-    "chipnet": "bun run chain-repo-updater.ts --chipnet  --cli='/home/jason/Workspace/bitcoin-cash-node/build/src/bitcoin-cli -datadir=/home/jason/Data/bitcoin-bchn-chipnet' /storage/bch-chipnet",
-    "testnet3": "bun run chain-repo-updater.ts --testnet3 --cli='/home/jason/Workspace/bitcoin-cash-node/build/src/bitcoin-cli -datadir=/home/jason/Data/bitcoin-bchn-testnet' /storage/bch-testnet3",
-    "testnet4": "bun run chain-repo-updater.ts --testnet4 --cli='/home/jason/Workspace/bitcoin-cash-node/build/src/bitcoin-cli -datadir=/home/jason/Data/bitcoin-bchn-testnet4' /storage/bch-testnet4",
-    "mainnet": "bun run chain-repo-updater.ts --mainnet  --cli='/home/jason/Workspace/bitcoin-cash-node/build/src/bitcoin-cli -datadir=/home/jason/Data/bitcoin-bchn' /storage/bch-mainnet"
+    "chipnet": "bun run chain-repo-updater.ts --cli='/home/jason/Workspace/bitcoin-cash-node/build/src/bitcoin-cli -datadir=/home/jason/Data/bitcoin-bchn-chipnet' /storage/bch-chipnet",
+    "testnet3": "bun run chain-repo-updater.ts --cli='/home/jason/Workspace/bitcoin-cash-node/build/src/bitcoin-cli -datadir=/home/jason/Data/bitcoin-bchn-testnet' /storage/bch-testnet3",
+    "testnet4": "bun run chain-repo-updater.ts --cli='/home/jason/Workspace/bitcoin-cash-node/build/src/bitcoin-cli -datadir=/home/jason/Data/bitcoin-bchn-testnet4' /storage/bch-testnet4",
+    "mainnet": "bun run chain-repo-updater.ts --cli='/home/jason/Workspace/bitcoin-cash-node/build/src/bitcoin-cli -datadir=/home/jason/Data/bitcoin-bchn' /storage/bch-mainnet"
   }
 }

@@ -1,3 +1,10 @@
 {
-  "cSpell.words": ["getblock", "getblockhash", "hashblock", "logv"]
+  "cSpell.words": [
+    "bestblockhash",
+    "getbestblockhash",
+    "getblock",
+    "getblockhash",
+    "hashblock",
+    "logv"
+  ]
 }

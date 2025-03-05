@@ -5,41 +5,27 @@
  * A minimal TS + Bun script that:
  *  - Initializes Git + Git LFS
  *  - Stores blockchain blocks in nested folders: blocks/<100k>/<1k>/<HEIGHT_HASH>.block
- *  - Syncs from last known block (minus ~11 for short reorg handling)
- *  - Subscribes to ZMQ "hashblock" to stay current
+ *  - Syncs from last known block (minus 11 for reorg handling)
+ *  - Polls `getbestblockhash` every minute to detect new blocks
  *  - Commits & optionally pushes each sync
  */
 
 import { parseArgs } from 'util';
-import { spawn } from 'bun';
+import { spawn, sleep } from 'bun';
 import { mkdirSync, readdirSync, existsSync, rmSync, writeFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { join } from 'path';
 
 interface CliOptions {
   help?: boolean;
-  mainnet?: boolean;
-  testnet3?: boolean;
-  testnet4?: boolean;
-  chipnet?: boolean;
-  'zmq-port'?: string;
-  'zmq-host'?: string;
-  cli?: string; // e.g. "/path/to/cli -datadir=foo"
+  cli?: string; // e.g. "bitcoin-cli -datadir=/my/data"
   verbose?: boolean;
   'no-push'?: boolean;
 }
-
-type NetFlag = 'mainnet' | 'testnet3' | 'testnet4' | 'chipnet';
 
 const parsed = parseArgs({
   allowPositionals: true,
   options: {
     help: { type: 'boolean' },
-    mainnet: { type: 'boolean' },
-    testnet3: { type: 'boolean' },
-    testnet4: { type: 'boolean' },
-    chipnet: { type: 'boolean' },
-    'zmq-port': { type: 'string' },
-    'zmq-host': { type: 'string' },
     cli: { type: 'string' },
     verbose: { type: 'boolean' },
     'no-push': { type: 'boolean' },
@@ -53,31 +39,16 @@ if (opts.help) {
 Usage:
   bun run chain-repo-updater.ts [OPTIONS] <repo-path>
 
-  Must specify either:
-    --mainnet | --testnet3 | --testnet4 | --chipnet
-  OR explicitly set --zmq-port=N
-
-  Other options:
-    --zmq-host=HOST (default 127.0.0.1)
-    --cli="CMD"     (default "bitcoin-cli")
-    --verbose
-    --no-push
-    --help
+  Options:
+    --cli="CMD"      (default "bitcoin-cli")
+    --verbose        (more logs)
+    --no-push        (do not push to remote)
+    --help           (show this message)
 
 Example:
-  bun run chain-repo-updater.ts --mainnet --cli="bitcoin-cli -datadir=/my/data" /storage/bch-mainnet
+  bun run chain-repo-updater.ts --cli="bitcoin-cli -datadir=/my/data" /storage/bch-mainnet
 `);
   process.exit(0);
-}
-
-const netFlags = ['mainnet', 'testnet3', 'testnet4', 'chipnet'] as const;
-const chosenFlag: NetFlag | undefined = netFlags.find((flag) => opts[flag]);
-
-if (!chosenFlag && !opts['zmq-port']) {
-  console.error(
-    'Error: must specify --mainnet|--testnet3|--testnet4|--chipnet or --zmq-port=N'
-  );
-  process.exit(1);
 }
 
 const repoPath = positionals[positionals.length - 1];
@@ -86,19 +57,9 @@ if (!repoPath || typeof repoPath !== 'string') {
   process.exit(1);
 }
 
-const defaultPorts: Record<NetFlag, string> = {
-  mainnet: '8332',
-  testnet3: '18332',
-  testnet4: '28332',
-  chipnet: '48332',
-};
-
 const verbose = !!opts.verbose;
 const noPush = !!opts['no-push'];
-const cliRaw = opts.cli || 'bitcoin-cli'; // "bitcoin-cli -datadir=..."
-const zmqHost = opts['zmq-host'] || '127.0.0.1';
-const zmqPort =
-  opts['zmq-port'] || (chosenFlag ? defaultPorts[chosenFlag] : '28332');
+const cliRaw = opts.cli || 'bitcoin-cli';
 
 function parseCliString(cliStr: string): {
   cliPath: string;
@@ -108,16 +69,14 @@ function parseCliString(cliStr: string): {
   if (!parts.length) {
     return { cliPath: 'bitcoin-cli', defaultArgs: [] };
   }
-  const cliPath = parts[0];
-  const defaultArgs = parts.slice(1);
+  const [cliPath, ...defaultArgs] = parts;
   return { cliPath, defaultArgs };
 }
-
-const { cliPath, defaultArgs: cliDefaultArgs } = parseCliString(cliRaw);
-const cli = [cliPath, ...cliDefaultArgs];
+const { cliPath, defaultArgs } = parseCliString(cliRaw);
+const cli = [cliPath, ...defaultArgs];
 
 if (verbose) {
-  console.log('Parsed CLI array:', cli);
+  console.log('Parsed CLI:', cli);
 }
 
 async function runCmd(cmdArray: string[], allowFail = false): Promise<string> {
@@ -286,43 +245,22 @@ async function performSync() {
   console.log('Beginning sync...');
   await performSync();
 
-  /** Spawn a Node child process for ZeroMQ subscription (zeromq doesn't support Bun v1.2.4) */
-  const nodeZmqBridge = `
-    const zmq = require('zeromq');
-    (async()=>{
-      const sock = new zmq.Subscriber();
-      sock.connect('tcp://${zmqHost}:${zmqPort}');
-      sock.subscribe('hashblock');
-      for await (const [topic] of sock) {
-        if(topic.toString()==='hashblock'){
-          process.stdout.write('hashblock\\n');
-        }
-      }
-    })();
-  `;
-  const child = spawn(['node', '-e', nodeZmqBridge], {
-    cwd: resolve(import.meta.dir),
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  console.log(
-    `Spawned Node child for ZMQ at ${zmqHost}:${zmqPort}, waiting for new blocks...`
-  );
-  child.stderr.pipeTo(
-    new WritableStream({
-      write(chunk) {
-        console.error('ZMQ child error:', new TextDecoder().decode(chunk));
-      },
-    })
-  );
-  const reader = child.stdout.getReader();
+  let lastTip = await runCmd([...cli, 'getbestblockhash']);
+  console.log('Polling for bestblockhash every 60s. Press Ctrl-C to stop.');
+
   while (true) {
-    const { done } = await reader.read();
-    if (done) {
-      console.log('ZMQ child ended or closed stdout. Exiting...');
-      break;
+    await sleep(60_000);
+    let currTip = await runCmd([...cli, 'getbestblockhash'], true);
+    if (currTip !== lastTip) {
+      if (verbose) {
+        console.log(
+          `Chain tip changed: ${lastTip} => ${currTip} => resyncing...`
+        );
+      }
+      await performSync();
+      lastTip = currTip;
+    } else if (verbose) {
+      console.log('No tip change.');
     }
-    console.log('ZMQ: hashblock => performing sync...');
-    await performSync();
   }
 })();
